@@ -1,0 +1,7 @@
+# .gitignore
+node_modules/
+.env
+results/
+*.log
+pagespeed-results*.json
+pagespeed-results*.csv
