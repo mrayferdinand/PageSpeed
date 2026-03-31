@@ -3,7 +3,7 @@ require('dotenv').config();
 
 async function testCategories() {
   const apiKey = process.env.PAGESPEED_API_KEY;
-  const testUrl = 'https://citatah.co.id/';
+  const testUrl = 'https://dikutip.ai/';
   
   // Build URL with all categories
   let apiUrl = `https://www.googleapis.com/pagespeedonline/v5/runPagespeed?url=${encodeURIComponent(testUrl)}&strategy=mobile`;

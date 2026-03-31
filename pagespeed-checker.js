@@ -83,7 +83,7 @@ function saveProcessedState(processed, results) {
 async function extractUrlsFromSitemap(sitemapUrl) {
   try {
     console.log(`📥 Fetching sitemap from: ${sitemapUrl}\n`);
-    
+
     const sitemap = new Sitemapper({
       url: sitemapUrl,
       timeout: 15000,
@@ -91,16 +91,127 @@ async function extractUrlsFromSitemap(sitemapUrl) {
         'User-Agent': 'Mozilla/5.0 (compatible; PageSpeedBulkChecker/1.0;)'
       }
     });
-    
-    const { sites } = await sitemap.fetch();
+
+    const { sites, errors } = await sitemap.fetch();
+
+    if (errors && errors.length > 0) {
+      console.warn(`⚠️  Sitemap fetch warnings: ${JSON.stringify(errors)}\n`);
+    }
+
+    if (sites.length === 0) {
+      throw new Error(`Sitemap returned 0 URLs. Possible causes: network timeout, blocked request, or invalid sitemap format.\nURL: ${sitemapUrl}`);
+    }
+
     console.log(`✅ Found ${sites.length} URLs in sitemap\n`);
-    
+
     return sites;
   } catch (error) {
     console.error('❌ Error fetching sitemap:', error.message);
     throw error;
   }
 }
+
+// Get URLs dari source yang dikonfigurasi (sitemap atau list)
+async function getUrls() {
+  if (config.urlSource === 'list') {
+    const urls = (config.urlList || []).filter(url => typeof url === 'string' && url.trim() !== '');
+    if (urls.length === 0) {
+      throw new Error('urlSource is set to "list" but urlList is empty. Please add URLs to config.urlList.');
+    }
+    console.log(`📋 Using URL list: ${urls.length} URLs\n`);
+    return urls;
+  }
+
+  // Default: sitemap
+  return extractUrlsFromSitemap(config.sitemapUrl);
+}
+
+// ===== CRITICAL AUDIT HELPERS =====
+
+function formatItemValue(val, valueType) {
+  if (val === undefined || val === null) return '';
+
+  if (typeof val === 'object') {
+    if (val.type === 'url' || val.url) {
+      const url = val.url || val.value || '';
+      return url.length > 80 ? '...' + url.slice(-77) : url;
+    }
+    if (val.type === 'code') return val.value || '';
+    if (val.type === 'link') return val.text || val.url || '';
+    if (val.type === 'source-location') return `${val.url || ''}:${val.line || 0}`;
+    if (val.type === 'node') return val.snippet || val.nodeLabel || '';
+    return String(val.value || val.text || val.url || '').slice(0, 100);
+  }
+
+  const num = Number(val);
+  if (!isNaN(num) && String(val).trim() !== '') {
+    if (valueType === 'timespanMs' || valueType === 'ms') {
+      return num >= 1000 ? `${(num / 1000).toFixed(1)} s` : `${Math.round(num)} ms`;
+    }
+    if (valueType === 'bytes') {
+      if (num >= 1024 * 1024) return `${(num / (1024 * 1024)).toFixed(1)} MB`;
+      return `${Math.round(num / 1024)} KB`;
+    }
+    if (valueType === 'numeric') return String(Math.round(num));
+  }
+
+  return String(val).slice(0, 120);
+}
+
+function simplifyAuditDetails(details) {
+  if (!details) return null;
+  const { type, items = [], headings = [] } = details;
+
+  if (type !== 'table' && type !== 'opportunity') return null;
+  if (!items.length) return null;
+
+  const cols = headings
+    .filter(h => h.key && h.key !== 'node')
+    .map(h => ({
+      key: h.key,
+      label: typeof h.label === 'string' ? h.label : (h.text || h.key),
+      valueType: h.valueType || h.itemType || 'text'
+    }));
+
+  if (!cols.length) return null;
+
+  const simplifiedItems = items.slice(0, 8).map(item => {
+    const row = {};
+    cols.forEach(col => {
+      const formatted = formatItemValue(item[col.key], col.valueType);
+      if (formatted) row[col.key] = formatted;
+    });
+    return row;
+  });
+
+  return { cols, items: simplifiedItems };
+}
+
+function extractCriticalAudits(lighthouseResult) {
+  const auditRefs = lighthouseResult.categories?.performance?.auditRefs || [];
+  const audits = lighthouseResult.audits || {};
+  const critical = [];
+
+  auditRefs.forEach(ref => {
+    const audit = audits[ref.id];
+    if (!audit) return;
+    if (audit.score === null || audit.score === undefined) return;
+    if (audit.score >= 0.5) return;
+
+    critical.push({
+      id: audit.id,
+      title: audit.title,
+      displayValue: audit.displayValue || null,
+      score: Math.round(audit.score * 100),
+      details: simplifyAuditDetails(audit.details)
+    });
+  });
+
+  critical.sort((a, b) => a.score - b.score);
+  return critical;
+}
+
+// ===== END CRITICAL AUDIT HELPERS =====
 
 // Check PageSpeed untuk satu URL dan strategy
 async function checkPageSpeed(url, strategy) {
@@ -168,7 +279,8 @@ async function checkPageSpeed(url, strategy) {
       tbt: getAuditValue('total-blocking-time'),
       speedIndex: getAuditValue('speed-index'),
       timestamp: new Date().toISOString(),
-      status: 'success'
+      status: 'success',
+      criticalAudits: extractCriticalAudits(lighthouseResult)
     };
   } catch (error) {
     let errorMessage = error.message;
@@ -230,7 +342,7 @@ async function runBulkCheck() {
     const previousResults = state.results;
     
     // Step 1: Extract URLs
-    let urls = await extractUrlsFromSitemap(config.sitemapUrl);
+    let urls = await getUrls();
     
     // Step 2: Deduplicate URLs
     urls = deduplicateUrls(urls);
@@ -467,6 +579,130 @@ function convertToCSV(results) {
   return `${headers.join(',')}\n${rows.join('\n')}`;
 }
 
+function escapeHtml(str) {
+  return String(str)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;');
+}
+
+function renderCriticalIssuesHTML(results) {
+  const successResults = results.filter(r => r.status === 'success' && r.criticalAudits?.length > 0);
+  if (!successResults.length) return '';
+
+  // Group by URL
+  const urlMap = {};
+  successResults.forEach(result => {
+    if (!urlMap[result.url]) urlMap[result.url] = {};
+    urlMap[result.url][result.strategy] = result.criticalAudits;
+  });
+
+  const urlBlocks = Object.entries(urlMap).map(([url, strategies]) => {
+    // Merge audits across strategies: same id = same issue
+    const auditMap = {};
+    Object.entries(strategies).forEach(([strategy, audits]) => {
+      audits.forEach(audit => {
+        if (!auditMap[audit.id]) {
+          auditMap[audit.id] = { ...audit, strategies: [], displayValues: {} };
+        }
+        auditMap[audit.id].strategies.push(strategy);
+        if (audit.displayValue) {
+          auditMap[audit.id].displayValues[strategy] = audit.displayValue;
+        }
+        if (!auditMap[audit.id].details && audit.details) {
+          auditMap[audit.id].details = audit.details;
+        }
+      });
+    });
+
+    const totalIssues = Object.keys(auditMap).length;
+
+    const auditCards = Object.values(auditMap).map(audit => {
+      // Strategy badge
+      const allStrategies = config.strategies;
+      const coversAll = allStrategies.every(s => audit.strategies.includes(s));
+      const strategyBadge = coversAll
+        ? `<span class="strat-badge strat-both">Mobile + Desktop</span>`
+        : audit.strategies.map(s =>
+            `<span class="strat-badge strat-${s}">${s.charAt(0).toUpperCase() + s.slice(1)}</span>`
+          ).join('');
+
+      // Display value — show combined if same, per-strategy if different
+      const dvEntries = Object.entries(audit.displayValues);
+      let displayValueHtml = '';
+      if (dvEntries.length === 0) {
+        displayValueHtml = '';
+      } else if (dvEntries.length === 1 || dvEntries[0][1] === dvEntries[1]?.[1]) {
+        displayValueHtml = `<span class="audit-saving">${escapeHtml(dvEntries[0][1])}</span>`;
+      } else {
+        displayValueHtml = dvEntries
+          .map(([s, v]) => `<span class="audit-saving">${escapeHtml(s)}: ${escapeHtml(v)}</span>`)
+          .join(' ');
+      }
+
+      // Details table
+      let detailsHtml = '';
+      if (audit.details?.items?.length > 0) {
+        const headers = audit.details.cols
+          .map(c => `<th>${escapeHtml(c.label)}</th>`)
+          .join('');
+        const rows = audit.details.items.map(item => {
+          const cells = audit.details.cols.map(col => {
+            const val = item[col.key] || '';
+            const isUrl = col.valueType === 'url' || col.key === 'url';
+            const display = escapeHtml(String(val));
+            return isUrl
+              ? `<td class="detail-url" title="${display}">${display}</td>`
+              : `<td>${display}</td>`;
+          }).join('');
+          return `<tr>${cells}</tr>`;
+        }).join('');
+
+        const itemCount = audit.details.items.length;
+        detailsHtml = `
+          <details class="detail-table-wrap">
+            <summary>Lihat detail (${itemCount} item${itemCount > 1 ? 's' : ''})</summary>
+            <div class="table-scroll">
+              <table class="detail-table">
+                <thead><tr>${headers}</tr></thead>
+                <tbody>${rows}</tbody>
+              </table>
+            </div>
+          </details>`;
+      }
+
+      return `
+        <div class="audit-card">
+          <div class="audit-header-row">
+            <div class="audit-left">
+              <span class="audit-title">${escapeHtml(audit.title)}</span>
+              ${strategyBadge}
+            </div>
+            <div class="audit-right">${displayValueHtml}</div>
+          </div>
+          ${detailsHtml}
+        </div>`;
+    }).join('');
+
+    return `
+      <details class="url-block" open>
+        <summary class="url-summary">
+          <span class="url-text">${escapeHtml(url)}</span>
+          <span class="issue-badge">${totalIssues} issue${totalIssues > 1 ? 's' : ''}</span>
+        </summary>
+        <div class="audit-list">${auditCards}</div>
+      </details>`;
+  }).join('');
+
+  return `
+    <div class="critical-section">
+      <h2>🚨 Critical Performance Issues</h2>
+      <p class="critical-note">Menampilkan audit dengan skor &lt; 50 dari kategori Performance.</p>
+      ${urlBlocks}
+    </div>`;
+}
+
 // Generate HTML Report
 function generateHTMLReport(results, totalUrls) {
   const successResults = results.filter(r => r.status === 'success');
@@ -539,6 +775,36 @@ function generateHTMLReport(results, totalUrls) {
     .desktop { background: #e6f4ea; color: #137333; }
     .failed { color: #c5221f; }
     .metrics { font-size: 12px; color: #666; }
+    /* Critical Issues */
+    .critical-section { margin-top: 48px; }
+    .critical-section h2 { font-size: 24px; margin-bottom: 8px; }
+    .critical-note { color: #666; font-size: 14px; margin-bottom: 20px; }
+    .url-block { border: 1px solid #e0e0e0; border-radius: 8px; margin-bottom: 12px; overflow: hidden; }
+    .url-summary { display: flex; justify-content: space-between; align-items: center; padding: 14px 16px; background: #f8f9fa; cursor: pointer; list-style: none; font-weight: 600; font-size: 14px; }
+    .url-summary::-webkit-details-marker { display: none; }
+    .url-summary::before { content: '▶'; margin-right: 8px; font-size: 11px; transition: transform 0.2s; }
+    details[open] > .url-summary::before { transform: rotate(90deg); }
+    .url-text { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: #1a73e8; }
+    .issue-badge { background: #fce8e6; color: #c5221f; padding: 3px 10px; border-radius: 12px; font-size: 12px; font-weight: 600; margin-left: 12px; white-space: nowrap; }
+    .audit-list { padding: 12px 16px; display: flex; flex-direction: column; gap: 10px; }
+    .audit-card { background: #fff; border: 1px solid #e8eaed; border-radius: 6px; padding: 12px 16px; }
+    .audit-header-row { display: flex; justify-content: space-between; align-items: flex-start; gap: 12px; }
+    .audit-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; flex: 1; }
+    .audit-title { font-weight: 600; font-size: 14px; }
+    .strat-badge { font-size: 11px; font-weight: 600; padding: 2px 7px; border-radius: 3px; text-transform: uppercase; white-space: nowrap; }
+    .strat-both { background: #e8f0fe; color: #1967d2; }
+    .strat-mobile { background: #e8f0fe; color: #1967d2; }
+    .strat-desktop { background: #e6f4ea; color: #137333; }
+    .audit-saving { font-size: 13px; color: #c5221f; font-weight: 600; background: #fce8e6; padding: 3px 8px; border-radius: 4px; white-space: nowrap; }
+    .detail-table-wrap { margin-top: 10px; }
+    .detail-table-wrap > summary { cursor: pointer; font-size: 13px; color: #1a73e8; list-style: none; padding: 4px 0; }
+    .detail-table-wrap > summary::-webkit-details-marker { display: none; }
+    .table-scroll { overflow-x: auto; margin-top: 8px; }
+    .detail-table { width: 100%; border-collapse: collapse; font-size: 12px; }
+    .detail-table th { background: #f8f9fa; padding: 8px 10px; text-align: left; font-weight: 600; color: #666; border-bottom: 2px solid #e0e0e0; white-space: nowrap; }
+    .detail-table td { padding: 7px 10px; border-bottom: 1px solid #f0f0f0; }
+    .detail-table tr:last-child td { border-bottom: none; }
+    .detail-url { max-width: 400px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: monospace; font-size: 11px; }
   </style>
 </head>
 <body>
@@ -642,6 +908,8 @@ function generateHTMLReport(results, totalUrls) {
         }).join('')}
       </tbody>
     </table>
+
+    ${renderCriticalIssuesHTML(results)}
   </div>
 </body>
 </html>`;
